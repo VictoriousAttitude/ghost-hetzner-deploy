@@ -1,0 +1,114 @@
+#cloud-config
+# =============================================================================
+# cloud-init template for the ghost-blog server.
+#
+# This is the ENTIRE bootstrap. The server has a deny-all inbound firewall and
+# no SSH key, so nothing can ever reach it over its public IP — every step
+# below must succeed unattended. Tailscale joins FIRST so that, if a later
+# step fails, we still have Tailscale SSH access for debugging.
+#
+# Template variables (rendered by deploy.sh with `envsubst` into an untracked
+# temp file — this tracked file never contains secrets):
+#   ${TS_AUTHKEY}      reusable Tailscale auth key
+#   ${MYSQL_PASSWORD}  generated per-deploy by deploy.sh
+# =============================================================================
+
+package_update: true
+
+write_files:
+  # First-boot apt/dpkg lock races (unattended-upgrades, apt-daily) are the
+  # classic way to lose an unattended bootstrap. Make every apt invocation —
+  # including the ones inside the vendor install scripts — wait for the lock
+  # instead of failing.
+  - path: /etc/apt/apt.conf.d/99-dpkg-lock-timeout
+    content: |
+      DPkg::Lock::Timeout "300";
+
+  # Ghost + MySQL stack. Written before runcmd executes (cloud-init runs
+  # write_files first), so `docker compose up` finds it in place.
+  - path: /opt/ghost/docker-compose.yml
+    permissions: "0600"
+    content: |
+      services:
+        ghost:
+          image: ghost:5-alpine
+          restart: unless-stopped
+          depends_on:
+            db:
+              condition: service_healthy
+          ports:
+            # Bind to localhost only: Funnel proxies from 127.0.0.1, and the
+            # port is never exposed publicly (defense in depth on top of the
+            # deny-all cloud firewall).
+            - "127.0.0.1:2368:2368"
+          environment:
+            # Ghost bakes absolute URLs into content, so the public Funnel URL
+            # must be set BEFORE the first boot.
+            url: https://ghost-blog.tail0266d4.ts.net
+            database__client: mysql
+            database__connection__host: db
+            database__connection__user: ghost
+            database__connection__password: "${MYSQL_PASSWORD}"
+            database__connection__database: ghost
+          volumes:
+            - ghost-content:/var/lib/ghost/content
+
+        db:
+          image: mysql:8
+          restart: unless-stopped
+          environment:
+            MYSQL_ROOT_PASSWORD: "${MYSQL_PASSWORD}"
+            MYSQL_DATABASE: ghost
+            MYSQL_USER: ghost
+            MYSQL_PASSWORD: "${MYSQL_PASSWORD}"
+          volumes:
+            - db-data:/var/lib/mysql
+          healthcheck:
+            # mysqladmin ping exits 0 once the server accepts connections
+            # (even unauthenticated — a denial proves the server is alive).
+            # -h 127.0.0.1 forces TCP, so the socket-only temporary server
+            # used during first-run initialization does not count as healthy.
+            test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--silent"]
+            interval: 5s
+            timeout: 5s
+            retries: 30
+
+      volumes:
+        ghost-content:
+        db-data:
+
+runcmd:
+  # 1. Tailscale first: this is our only door into the machine, so it gets
+  #    bounded retries. Download-then-run (never `curl | sh`: a failed curl
+  #    would feed sh an empty script that "succeeds"). Transient network/apt
+  #    failures on first boot must not strand an unreachable server.
+  - |
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+      curl -fsSL https://tailscale.com/install.sh -o /run/tailscale-install.sh \
+        && sh /run/tailscale-install.sh && break
+      echo "tailscale install: attempt $i failed, retrying in 15s" >&2
+      sleep 15
+    done
+  - |
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+      tailscale up --ssh --authkey=${TS_AUTHKEY} --hostname=ghost-blog && break
+      echo "tailscale up: attempt $i failed, retrying in 15s" >&2
+      sleep 15
+    done
+  # 2. Docker (get.docker.com installs engine + compose plugin). Same retry
+  #    discipline; if this still fails, the box is at least reachable over
+  #    Tailscale SSH for debugging.
+  - |
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+      curl -fsSL https://get.docker.com -o /run/docker-install.sh \
+        && sh /run/docker-install.sh && break
+      echo "docker install: attempt $i failed, retrying in 15s" >&2
+      sleep 15
+    done
+  # 3. Start the blog. MySQL healthcheck gates Ghost's start, so Ghost does
+  #    not crash-loop during MySQL's ~30s first-run initialization.
+  - docker compose -f /opt/ghost/docker-compose.yml up -d
+  # 4. Publish 127.0.0.1:2368 to the internet on :443 as
+  #    https://ghost-blog.tail0266d4.ts.net (TLS terminated by Tailscale).
+  #    --bg persists the config so it survives reboots.
+  - tailscale funnel --bg 2368

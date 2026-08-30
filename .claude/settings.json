@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -c 'f=$(python3 -c \"import json,sys;print(json.load(sys.stdin).get(\\\"tool_input\\\",{}).get(\\\"file_path\\\",\\\"\\\"))\"); case \"$f\" in *.sh) shellcheck -x \"$f\" >&2 && bash -n \"$f\" >&2 || exit 2;; esac'",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
